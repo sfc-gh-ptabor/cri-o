@@ -18,6 +18,7 @@ import (
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 	crierrors "k8s.io/cri-api/pkg/errors"
 
+	"github.com/cri-o/cri-o/internal/imageprovider"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/storage"
 	"github.com/cri-o/cri-o/server/metrics"
@@ -28,7 +29,57 @@ import (
 func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*types.PullImageResponse, error) {
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
-	// TODO: what else do we need here? (Signatures when the story isn't just pulling from docker://)
+	
+	img := req.GetImage()
+	if img == nil {
+		return nil, fmt.Errorf("image specification is required")
+	}
+
+	image := img.GetImage()
+	if image == "" {
+		return nil, fmt.Errorf("image field cannot be empty")
+	}
+
+	log.Infof(ctx, "Pulling image: %s", image)
+
+	// Use image provider service if available, otherwise fall back to legacy method
+	if s.imageProviderService != nil {
+		return s.pullImageWithProviders(ctx, req)
+	}
+
+	// Legacy path - keep existing functionality for backward compatibility
+	return s.pullImageLegacy(ctx, req)
+}
+
+// pullImageWithProviders uses the pluggable image provider system
+func (s *Server) pullImageWithProviders(ctx context.Context, req *types.PullImageRequest) (*types.PullImageResponse, error) {
+	img := req.GetImage()
+	
+	// Create provider options
+	options := &imageprovider.ImageProviderOptions{
+		Auth: req.GetAuth(),
+		PodSandboxConfig: req.GetSandboxConfig(),
+		SystemContext: s.config.SystemContext,
+	}
+
+	// Pull using image provider service
+	result, err := s.imageProviderService.PullImage(ctx, img, options)
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return nil, fmt.Errorf("%w: %w", crierrors.ErrRegistryUnavailable, err)
+		}
+		return nil, storage.WrapSignatureCRIErrorIfNeeded(err)
+	}
+
+	log.Infof(ctx, "Pulled image: %v", result.ImageRef)
+
+	return &types.PullImageResponse{
+		ImageRef: result.ImageRef.StringForOutOfProcessConsumptionOnly(),
+	}, nil
+}
+
+// pullImageLegacy maintains the original pull behavior for backward compatibility
+func (s *Server) pullImageLegacy(ctx context.Context, req *types.PullImageRequest) (*types.PullImageResponse, error) {
 	var err error
 
 	image := ""
@@ -38,7 +89,7 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 		image = img.GetImage()
 	}
 
-	log.Infof(ctx, "Pulling image: %s", image)
+	log.Infof(ctx, "Pulling image (legacy): %s", image)
 
 	pullArgs := pullArguments{image: image}
 

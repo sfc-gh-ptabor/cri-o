@@ -564,6 +564,21 @@ func initCrioTemplateConfig(c *Config) ([]*templateConfigValue, error) {
 			isDefaultValue: simpleEqual(dc.OCIArtifactMountSupport, c.OCIArtifactMountSupport),
 		},
 		{
+			templateString: templateStringCrioImageProvidersEnablePluggable,
+			group:          crioImageConfig,
+			isDefaultValue: simpleEqual(dc.ImageProviders.EnablePluggableProviders, c.ImageProviders.EnablePluggableProviders),
+		},
+		{
+			templateString: templateStringCrioImageProvidersRootFSEnable,
+			group:          crioImageConfig,
+			isDefaultValue: simpleEqual(dc.ImageProviders.RootFS.Enable, c.ImageProviders.RootFS.Enable),
+		},
+		{
+			templateString: templateStringCrioImageProvidersRootFSAllowedPaths,
+			group:          crioImageConfig,
+			isDefaultValue: slices.Equal(dc.ImageProviders.RootFS.AllowedPaths, c.ImageProviders.RootFS.AllowedPaths),
+		},
+		{
 			templateString: templateStringCrioNetworkCniDefaultNetwork,
 			group:          crioNetworkConfig,
 			isDefaultValue: simpleEqual(dc.CNIDefaultNetwork, c.CNIDefaultNetwork),
@@ -1544,6 +1559,28 @@ const templateStringCrioImageShortNameMode = `# The mode of short name resolutio
 # If "enforcing", an image pull will fail if a short name is used, but the results are ambiguous.
 # If "disabled", the first result will be chosen.
 {{ $.Comment }}short_name_mode = "{{ .ShortNameMode }}"
+
+`
+
+const templateStringCrioImageProvidersEnablePluggable = `# Enable pluggable image providers for handling different image types.
+# When enabled, allows using custom image providers like root filesystem directories.
+{{ $.Comment }}[crio.image.image_providers]
+{{ $.Comment }}enable_pluggable_providers = {{ .ImageProviders.EnablePluggableProviders }}
+
+`
+
+const templateStringCrioImageProvidersRootFSEnable = `# Enable the root filesystem image provider for handling root-fs:// image references.
+# This allows containers to use local filesystem directories directly as root filesystems.
+{{ $.Comment }}[crio.image.image_providers.rootfs]
+{{ $.Comment }}enable = {{ .ImageProviders.RootFS.Enable }}
+
+`
+
+const templateStringCrioImageProvidersRootFSAllowedPaths = `# List of allowed base paths for root filesystem images.
+# If empty, any absolute path is allowed (not recommended for production).
+# Example: ["/opt/containers", "/var/lib/images"]
+{{ $.Comment }}{{ if .ImageProviders.RootFS.AllowedPaths }}allowed_paths = [
+{{ range $path := .ImageProviders.RootFS.AllowedPaths }}{{ $.Comment }}{{ printf "\t%q,\n" $path }}{{ end }}{{ $.Comment }}]{{ end }}
 
 `
 

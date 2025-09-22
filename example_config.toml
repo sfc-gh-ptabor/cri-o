@@ -1,0 +1,20 @@
+# Example CRI-O configuration with image providers enabled
+
+[crio.image]
+# Enable pluggable image providers for handling different image types.
+# When enabled, allows using custom image providers like root filesystem directories.
+[crio.image.image_providers]
+enable_pluggable_providers = true
+
+# Enable the root filesystem image provider for handling root-fs:// image references.
+# This allows containers to use local filesystem directories directly as root filesystems.
+[crio.image.image_providers.rootfs]
+enable = true
+
+# List of allowed base paths for root filesystem images.
+# If empty, any absolute path is allowed (not recommended for production).
+# Example: ["/opt/containers", "/var/lib/images"]
+allowed_paths = [
+	"/opt/my-containers",
+	"/var/lib/crio-rootfs-images",
+]
