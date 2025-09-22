@@ -534,6 +534,44 @@ func (s *Server) CreateContainer(ctx context.Context, req *types.CreateContainer
 		return nil
 	})
 
+	// Check if this is a chroot:// image and store path in metadata
+	userRequestedImage, err := ctr.UserRequestedImage()
+	if err != nil {
+		return nil, err
+	}
+	
+	if strings.HasPrefix(userRequestedImage, "chroot://") {
+		chrootPath := strings.TrimPrefix(userRequestedImage, "chroot://")
+		chrootPath = filepath.Clean(chrootPath)
+		
+		// Validate the chroot path exists and is absolute
+		if !filepath.IsAbs(chrootPath) {
+			return nil, fmt.Errorf("chroot path must be absolute: %s", chrootPath)
+		}
+		
+		if info, err := os.Stat(chrootPath); err != nil {
+			return nil, fmt.Errorf("chroot path does not exist: %w", err)
+		} else if !info.IsDir() {
+			return nil, fmt.Errorf("chroot path is not a directory: %s", chrootPath)
+		}
+		
+		// Store chroot path in container metadata for StartContainer to use
+		containerMetadata, err := s.ContainerServer.StorageRuntimeServer().GetContainerMetadata(ctr.ID())
+		if err != nil {
+			return nil, fmt.Errorf("failed to get container metadata: %w", err)
+		}
+		
+		// Mark as chroot container by prefixing ImageID with "chroot:"
+		containerMetadata.ImageID = "chroot:" + chrootPath
+		containerMetadata.ImageName = userRequestedImage
+		
+		if err := s.ContainerServer.StorageRuntimeServer().SetContainerMetadata(ctr.ID(), &containerMetadata); err != nil {
+			return nil, fmt.Errorf("failed to store chroot metadata: %w", err)
+		}
+		
+		log.Infof(ctx, "Container %s configured for chroot: %s", ctr.ID(), chrootPath)
+	}
+
 	s.addContainer(ctx, newContainer)
 	resourceCleaner.Add(ctx, "createCtr: removing container "+newContainer.ID(), func() error {
 		s.removeContainer(ctx, newContainer)

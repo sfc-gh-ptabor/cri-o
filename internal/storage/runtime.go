@@ -3,6 +3,9 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	istorage "github.com/containers/image/v5/storage"
@@ -497,6 +500,21 @@ func (r *runtimeService) StartContainer(idOrName string) (string, error) {
 	metadata := RuntimeContainerMetadata{}
 	if err := json.Unmarshal([]byte(container.Metadata), &metadata); err != nil {
 		return "", err
+	}
+
+	// Check if this is a chroot container - return path directly instead of mounting
+	if strings.HasPrefix(metadata.ImageID, "chroot:") {
+		chrootPath := strings.TrimPrefix(metadata.ImageID, "chroot:")
+		
+		// Validate the chroot path still exists
+		if info, err := os.Stat(chrootPath); err != nil {
+			return "", fmt.Errorf("chroot path no longer accessible: %w", err)
+		} else if !info.IsDir() {
+			return "", fmt.Errorf("chroot path is not a directory: %s", chrootPath)
+		}
+		
+		logrus.Debugf("Using chroot path for container %q: %q", container.ID, chrootPath)
+		return chrootPath, nil
 	}
 
 	mountPoint, err := r.storageImageServer.GetStore().Mount(container.ID, metadata.MountLabel)
