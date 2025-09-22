@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -520,6 +521,27 @@ func (s *Server) CreateContainer(ctx context.Context, req *types.CreateContainer
 
 		return nil
 	})
+
+	// Check if this is a root-fs:// image that should bypass containers/storage
+	userRequestedImage, err := ctr.UserRequestedImage()
+	if err != nil {
+		return nil, err
+	}
+	
+	if s.isRootFSImage(userRequestedImage) {
+		log.Infof(ctx, "Detected root-fs image: %s", userRequestedImage)
+		ociContainer, err := s.createRootFSContainer(ctx, req, sb, ctr, userRequestedImage)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Add the container to the server's tracking
+		s.addContainer(ctx, ociContainer)
+		
+		return &types.CreateContainerResponse{
+			ContainerId: ociContainer.ID(),
+		}, nil
+	}
 
 	newContainer, err := s.createSandboxContainer(ctx, ctr, sb)
 	if err != nil {
@@ -1488,4 +1510,422 @@ func (s *Server) verifyImageSignature(ctx context.Context, namespace, userSpecif
 	}
 
 	return nil
+}
+
+// isRootFSImage checks if the given image reference is a root-fs:// image
+func (s *Server) isRootFSImage(imageRef string) bool {
+	return strings.HasPrefix(imageRef, "root-fs://")
+}
+
+// extractRootFSPath extracts the filesystem path from a root-fs:// URL  
+func (s *Server) extractRootFSPath(imageRef string) (string, error) {
+	if !s.isRootFSImage(imageRef) {
+		return "", fmt.Errorf("not a root-fs image: %s", imageRef)
+	}
+	
+	path := strings.TrimPrefix(imageRef, "root-fs://")
+	if path == "" {
+		return "", fmt.Errorf("empty path in root-fs reference: %s", imageRef)
+	}
+	
+	// Clean and validate the path
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("root-fs path must be absolute: %s", path)
+	}
+	
+	return path, nil
+}
+
+// validateRootFSPath validates that the root filesystem path is accessible and appears to be a valid rootfs
+func (s *Server) validateRootFSPath(ctx context.Context, rootfsPath string) error {
+	// Check if enabled and path is allowed
+	if s.imageProviderService != nil && s.config.ImageProviders.RootFS.Enable {
+		// Validate against allowed paths if configured
+		if len(s.config.ImageProviders.RootFS.AllowedPaths) > 0 {
+			allowed := false
+			cleanPath := filepath.Clean(rootfsPath)
+			
+			for _, allowedPath := range s.config.ImageProviders.RootFS.AllowedPaths {
+				cleanAllowed := filepath.Clean(allowedPath)
+				if strings.HasPrefix(cleanPath, cleanAllowed) {
+					allowed = true
+					break
+				}
+			}
+			
+			if !allowed {
+				return fmt.Errorf("root-fs path not allowed: %s (allowed paths: %v)", rootfsPath, s.config.ImageProviders.RootFS.AllowedPaths)
+			}
+		}
+	} else {
+		return fmt.Errorf("root-fs image provider is not enabled")
+	}
+	
+	// Check if path exists and is a directory
+	info, err := os.Stat(rootfsPath)
+	if err != nil {
+		return fmt.Errorf("root-fs path does not exist: %w", err)
+	}
+	
+	if !info.IsDir() {
+		return fmt.Errorf("root-fs path is not a directory: %s", rootfsPath)
+	}
+	
+	// Check for basic rootfs structure (optional validation)
+	requiredDirs := []string{"bin", "etc", "usr"}
+	for _, dir := range requiredDirs {
+		dirPath := filepath.Join(rootfsPath, dir)
+		if info, err := os.Stat(dirPath); err != nil || !info.IsDir() {
+			log.Warnf(ctx, "Root filesystem %s missing standard directory %s - may not be a valid rootfs", rootfsPath, dir)
+		}
+	}
+	
+	log.Infof(ctx, "Validated root-fs path: %s", rootfsPath)
+	return nil
+}
+
+// createRootFSContainer creates a container using a direct root filesystem path
+// This bypasses containers/storage and uses the filesystem directly
+func (s *Server) createRootFSContainer(ctx context.Context, req *types.CreateContainerRequest, sb *sandbox.Sandbox, ctr container.Container, userRequestedImage string) (*oci.Container, error) {
+	ctx, span := log.StartSpan(ctx)
+	defer span.End()
+	
+	// Extract and validate the root filesystem path
+	rootfsPath, err := s.extractRootFSPath(userRequestedImage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract root-fs path: %w", err)
+	}
+	
+	// Validate the root filesystem path
+	if err := s.validateRootFSPath(ctx, rootfsPath); err != nil {
+		return nil, fmt.Errorf("root-fs path validation failed: %w", err)
+	}
+	
+	log.Infof(ctx, "Creating container %s with root filesystem: %s", ctr.ID(), rootfsPath)
+	
+	containerConfig := req.GetConfig()
+	metadata := containerConfig.GetMetadata()
+	
+	// Set up container directories similar to normal containers but simpler
+	containerInfo, err := s.createRootFSContainerInfo(ctx, ctr, sb, rootfsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create container info: %w", err)
+	}
+	
+	// Generate OCI runtime specification with direct rootfs
+	specgen, err := s.createRootFSSpec(ctx, containerConfig, sb, containerInfo, rootfsPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OCI spec: %w", err)
+	}
+	
+	// Set up logging path
+	logPath, err := ctr.LogPath(sb.LogDir())
+	if err != nil {
+		return nil, err
+	}
+	
+	// Create container labels and annotations
+	labels := containerConfig.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	
+	annotations := containerConfig.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	
+	// Mark this as a root-fs container for identification
+	labels["io.cri-o.image.type"] = "root-fs"
+	annotations["io.cri-o.image.rootfs.path"] = rootfsPath
+	
+	// Create fake image references for compatibility with existing code
+	imageID := storage.StorageImageID{} // Empty image ID for root-fs
+	someNameOfTheImage := &storage.RegistryImageReference{} // Empty registry reference
+	someRepoDigest := fmt.Sprintf("root-fs@sha256:%x", sha256.Sum256([]byte(rootfsPath)))
+	
+	// Create container metadata for CRI
+	criMetadata := &types.ContainerMetadata{
+		Name:    metadata.GetName(),
+		Attempt: metadata.GetAttempt(),
+	}
+	
+	// Determine stop signal (default to SIGTERM)
+	stopSignal := "SIGTERM"
+	if containerConfig.GetLinux() != nil && containerConfig.GetLinux().GetSecurityContext() != nil {
+		// Use any configured stop signal or default
+		stopSignal = "SIGTERM"
+	}
+	
+	// Create OCI container
+	created := time.Now()
+	ociContainer, err := oci.NewContainer(
+		ctr.ID(),
+		ctr.Name(),
+		containerInfo.RunDir,
+		logPath,
+		labels,
+		annotations,
+		containerConfig.GetAnnotations(),
+		userRequestedImage,           // userRequestedImage
+		someNameOfTheImage,          // someNameOfTheImage
+		&imageID,                    // imageID  
+		someRepoDigest,              // someRepoDigest
+		criMetadata,
+		sb.ID(),
+		containerConfig.GetTty(),
+		containerConfig.GetStdin(),
+		containerConfig.GetStdinOnce(),
+		sb.RuntimeHandler(),
+		containerInfo.Dir,
+		created,
+		stopSignal,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OCI container: %w", err)
+	}
+	
+	// Set the OCI spec and mount point
+	ociContainer.SetSpec(specgen.Config)
+	ociContainer.SetMountPoint(rootfsPath) // Use direct path as mount point
+	
+	log.Infof(ctx, "Successfully created root-fs container %s using %s", ctr.ID(), rootfsPath)
+	
+	return ociContainer, nil
+}
+
+// RootFSContainerInfo holds information for a root-fs container
+type RootFSContainerInfo struct {
+	Dir      string // Container work directory
+	RunDir   string // Container run directory 
+	RootPath string // Direct root filesystem path
+}
+
+// createRootFSContainerInfo creates container directory structure for root-fs containers
+func (s *Server) createRootFSContainerInfo(ctx context.Context, ctr container.Container, sb *sandbox.Sandbox, rootfsPath string) (*RootFSContainerInfo, error) {
+	// Create container directories similar to regular containers
+	containerDir := filepath.Join(s.config.Root, "containers", ctr.ID())
+	if err := os.MkdirAll(containerDir, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to create container directory: %w", err)
+	}
+	
+	runDir := filepath.Join(s.config.RunRoot, "containers", ctr.ID())  
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to create container run directory: %w", err)
+	}
+	
+	// Create subdirectories
+	subdirs := []string{"userdata", "mounts"}
+	for _, subdir := range subdirs {
+		subdirPath := filepath.Join(containerDir, subdir)
+		if err := os.MkdirAll(subdirPath, 0o700); err != nil {
+			return nil, fmt.Errorf("failed to create container subdirectory %s: %w", subdir, err)
+		}
+	}
+	
+	return &RootFSContainerInfo{
+		Dir:      containerDir,
+		RunDir:   runDir, 
+		RootPath: rootfsPath,
+	}, nil
+}
+
+// createRootFSSpec creates an OCI runtime specification for root-fs containers
+func (s *Server) createRootFSSpec(ctx context.Context, containerConfig *types.ContainerConfig, sb *sandbox.Sandbox, containerInfo *RootFSContainerInfo, rootfsPath string) (*generate.Generator, error) {
+	// Create a new OCI spec generator
+	specgen, err := generate.New("linux")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create spec generator: %w", err)
+	}
+	
+	// Set root filesystem to the direct path - this is the key difference!
+	specgen.SetRootPath(rootfsPath)
+	specgen.SetRootReadonly(containerConfig.GetLinux().GetSecurityContext().GetReadonlyRootfs())
+	
+	// Set process configuration
+	if containerConfig.Command != nil && len(containerConfig.Command) > 0 {
+		specgen.SetProcessArgs(containerConfig.Command)
+	} else {
+		// Default command if none specified
+		specgen.SetProcessArgs([]string{"/bin/sh"})
+	}
+	
+	// Set working directory
+	if containerConfig.WorkingDir != "" {
+		specgen.SetProcessCwd(containerConfig.WorkingDir)
+	} else {
+		specgen.SetProcessCwd("/")
+	}
+	
+	// Set environment variables
+	if containerConfig.Envs != nil {
+		for _, env := range containerConfig.Envs {
+			specgen.AddProcessEnv(env.Key, env.Value)
+		}
+	}
+	
+	// Set hostname from sandbox
+	specgen.SetHostname(sb.Hostname())
+	
+	// Configure user and groups  
+	securityContext := containerConfig.GetLinux().GetSecurityContext()
+	if securityContext != nil {
+		if securityContext.GetRunAsUser() != nil {
+			uid := securityContext.GetRunAsUser().Value
+			specgen.SetProcessUID(uint32(uid))
+		}
+		
+		if securityContext.GetRunAsGroup() != nil {
+			gid := securityContext.GetRunAsGroup().Value
+			specgen.SetProcessGID(uint32(gid))
+		}
+		
+		// Set supplemental groups
+		if securityContext.GetSupplementalGroups() != nil {
+			for _, group := range securityContext.GetSupplementalGroups() {
+				specgen.AddProcessAdditionalGid(uint32(group))
+			}
+		}
+	}
+	
+	// Add essential mounts (proc, sys, dev, etc.)
+	s.addRootFSMounts(&specgen, containerConfig, sb)
+	
+	// Configure namespaces - join sandbox namespaces
+	s.configureRootFSNamespaces(&specgen, sb)
+	
+	// Set up security context (capabilities, etc.)
+	if securityContext != nil {
+		s.configureRootFSSecurity(&specgen, securityContext)
+	}
+	
+	return &specgen, nil
+}
+
+// addRootFSMounts adds essential mounts for root-fs containers
+func (s *Server) addRootFSMounts(specgen *generate.Generator, containerConfig *types.ContainerConfig, sb *sandbox.Sandbox) {
+	// Add proc filesystem
+	specgen.AddMount(rspec.Mount{
+		Source:      "proc",
+		Destination: "/proc", 
+		Type:        "proc",
+		Options:     []string{"nosuid", "noexec", "nodev"},
+	})
+	
+	// Add sys filesystem (read-only)
+	specgen.AddMount(rspec.Mount{
+		Source:      "sysfs",
+		Destination: "/sys",
+		Type:        "sysfs", 
+		Options:     []string{"nosuid", "noexec", "nodev", "ro"},
+	})
+	
+	// Add dev filesystem
+	specgen.AddMount(rspec.Mount{
+		Source:      "tmpfs",
+		Destination: "/dev",
+		Type:        "tmpfs",
+		Options:     []string{"nosuid", "strictatime", "mode=755", "size=65536k"},
+	})
+	
+	// Add CRI mounts specified in container config
+	if containerConfig.Mounts != nil {
+		for _, mount := range containerConfig.Mounts {
+			opts := []string{"bind"}
+			if mount.Readonly {
+				opts = append(opts, "ro")
+			} else {
+				opts = append(opts, "rw")
+			}
+			
+			specgen.AddMount(rspec.Mount{
+				Source:      mount.HostPath,
+				Destination: mount.ContainerPath,
+				Type:        "bind",
+				Options:     opts,
+			})
+		}
+	}
+	
+	// Add sandbox files (resolv.conf, hostname, etc.) if available
+	options := []string{"rw", "bind", "nodev", "nosuid", "noexec"}
+	
+	if sb.ResolvPath() != "" {
+		specgen.AddMount(rspec.Mount{
+			Source:      sb.ResolvPath(),
+			Destination: "/etc/resolv.conf",
+			Type:        "bind",
+			Options:     options,
+		})
+	}
+	
+	if sb.HostnamePath() != "" {
+		specgen.AddMount(rspec.Mount{
+			Source:      sb.HostnamePath(), 
+			Destination: "/etc/hostname",
+			Type:        "bind",
+			Options:     options,
+		})
+	}
+}
+
+// configureRootFSNamespaces configures namespaces for root-fs containers
+func (s *Server) configureRootFSNamespaces(specgen *generate.Generator, sb *sandbox.Sandbox) {
+	// Share network, IPC, and UTS namespaces with the sandbox (standard CRI behavior)
+	if sb.InfraContainer() != nil && sb.InfraContainer().State() != nil {
+		infraPid := sb.InfraContainer().State().Pid
+		
+		// Join network namespace
+		specgen.AddOrReplaceLinuxNamespace("network", fmt.Sprintf("/proc/%d/ns/net", infraPid))
+		
+		// Join IPC namespace
+		specgen.AddOrReplaceLinuxNamespace("ipc", fmt.Sprintf("/proc/%d/ns/ipc", infraPid))
+		
+		// Join UTS namespace (hostname)
+		specgen.AddOrReplaceLinuxNamespace("uts", fmt.Sprintf("/proc/%d/ns/uts", infraPid))
+	}
+	
+	// Create new PID and mount namespaces for isolation
+	specgen.AddOrReplaceLinuxNamespace("pid", "")
+	specgen.AddOrReplaceLinuxNamespace("mount", "")
+}
+
+// configureRootFSSecurity configures security settings for root-fs containers
+func (s *Server) configureRootFSSecurity(specgen *generate.Generator, securityContext *types.LinuxContainerSecurityContext) {
+	// Handle capabilities
+	if securityContext.Capabilities != nil {
+		// Add capabilities
+		if securityContext.Capabilities.AddCapabilities != nil {
+			for _, cap := range securityContext.Capabilities.AddCapabilities {
+				specgen.AddProcessCapabilityBounding(cap)
+				specgen.AddProcessCapabilityEffective(cap)
+				specgen.AddProcessCapabilityInheritable(cap)
+				specgen.AddProcessCapabilityPermitted(cap)
+			}
+		}
+		
+		// Drop capabilities
+		if securityContext.Capabilities.DropCapabilities != nil {
+			for _, cap := range securityContext.Capabilities.DropCapabilities {
+				specgen.DropProcessCapabilityBounding(cap)
+				specgen.DropProcessCapabilityEffective(cap)
+				specgen.DropProcessCapabilityInheritable(cap)
+				specgen.DropProcessCapabilityPermitted(cap)
+			}
+		}
+	}
+	
+	// Handle privileged containers
+	if securityContext.GetPrivileged() {
+		specgen.SetupPrivileged(true)
+	}
+	
+	// Set SELinux labels if configured
+	if securityContext.GetSelinuxOptions() != nil {
+		selinuxOpts := securityContext.GetSelinuxOptions()
+		if selinuxOpts.GetType() != "" {
+			specgen.SetProcessSelinuxLabel(selinuxOpts.GetType())
+		}
+	}
 }

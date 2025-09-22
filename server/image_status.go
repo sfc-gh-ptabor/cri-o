@@ -13,6 +13,7 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/cri-o/cri-o/internal/imageprovider"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/ociartifact"
 	pkgstorage "github.com/cri-o/cri-o/internal/storage"
@@ -20,6 +21,7 @@ import (
 
 // ImageStatus returns the status of the image.
 func (s *Server) ImageStatus(ctx context.Context, req *types.ImageStatusRequest) (*types.ImageStatusResponse, error) {
+	_ = (*imageprovider.Service)(nil) // Force import usage
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
 
@@ -30,6 +32,12 @@ func (s *Server) ImageStatus(ctx context.Context, req *types.ImageStatusRequest)
 
 	log.Infof(ctx, "Checking image status: %s", img.GetImage())
 
+	// Use image provider service if available
+	if s.imageProviderService != nil {
+		return s.imageStatusWithProviders(ctx, req)
+	}
+
+	// Legacy path
 	status, err := s.storageImageStatus(ctx, img)
 	if err != nil {
 		return nil, err
@@ -181,4 +189,114 @@ func createImageInfo(result *pkgstorage.ImageResult) (map[string]string, error) 
 	}
 
 	return map[string]string{"info": string(bytes)}, nil
+}
+
+// imageStatusWithProviders uses the pluggable image provider system for image status
+func (s *Server) imageStatusWithProviders(ctx context.Context, req *types.ImageStatusRequest) (*types.ImageStatusResponse, error) {
+	img := req.GetImage()
+	
+	// Try to get status using image provider service
+	result, err := s.imageProviderService.ImageStatus(ctx, img)
+	if err != nil {
+		// Fall back to legacy behavior for compatibility
+		return s.imageStatusLegacy(ctx, req)
+	}
+	
+	// Convert provider result to CRI response
+	response := &types.ImageStatusResponse{
+		Image: &types.Image{
+			Id:          result.Digest,
+			RepoTags:    []string{img.GetImage()},
+			RepoDigests: []string{result.ImageRef.StringForOutOfProcessConsumptionOnly()},
+			Size:        0, // Size will be set below if available
+		},
+	}
+	
+	if result.Size != nil {
+		response.Image.Size = *result.Size
+	}
+	
+	// Add verbose info if requested
+	if req.GetVerbose() {
+		info := map[string]string{
+			"provider": "pluggable",
+		}
+		
+		// Add metadata from provider
+		for k, v := range result.Metadata {
+			info[k] = v
+		}
+		
+		response.Info = info
+	}
+	
+	return response, nil
+}
+
+// imageStatusLegacy provides the original image status behavior
+func (s *Server) imageStatusLegacy(ctx context.Context, req *types.ImageStatusRequest) (*types.ImageStatusResponse, error) {
+	img := req.GetImage()
+	
+	status, err := s.storageImageStatus(ctx, img)
+	if err != nil {
+		return nil, err
+	}
+
+	if status == nil {
+		artifact, err := s.ArtifactStore().Status(ctx, img.GetImage())
+		if err == nil {
+			return &types.ImageStatusResponse{
+				Image: artifact.CRIImage(),
+			}, nil
+		}
+
+		if errors.Is(err, ociartifact.ErrNotFound) {
+			log.Infof(ctx, "Neither image nor artifact %s found", img.GetImage())
+		} else if err != nil {
+			log.Errorf(ctx, "Unable to get artifact: %v", err)
+		}
+
+		return &types.ImageStatusResponse{}, nil
+	}
+
+	imageID, ref := status.ID.IDStringForOutOfProcessConsumptionOnly(), status.RepoDigests
+	if len(status.RepoTags) == 0 && len(status.RepoDigests) == 0 {
+		// In this case set the image ID to the ID itself with digest prefix and the ref to empty.
+		imageID = storage.ImageDigestBigDataKey + ":" + status.ID.IDStringForOutOfProcessConsumptionOnly()
+		ref = []string{}
+	}
+
+	var UID *int64
+	var username string
+	if status.User != "" {
+		UID, username = getUserFromImage(status.User)
+	}
+
+	response := &types.ImageStatusResponse{
+		Image: &types.Image{
+			Id:          imageID,
+			RepoTags:    status.RepoTags,
+			RepoDigests: ref,
+			Size:        0,
+			Uid:         &types.Int64Value{Value: 0},
+			Username:    username,
+			Spec:        img,
+		},
+	}
+	if status.Size != nil {
+		response.Image.Size = *status.Size
+	}
+	if UID != nil {
+		response.Image.Uid.Value = *UID
+	}
+
+	if req.GetVerbose() {
+		info, err := createImageInfo(status)
+		if err != nil {
+			return nil, fmt.Errorf("create image info: %w", err)
+		}
+		response.Info = info
+	}
+
+	return response, nil
 }

@@ -8,6 +8,7 @@ import (
 	storagetypes "github.com/containers/storage"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
 
+	"github.com/cri-o/cri-o/internal/imageprovider"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/ociartifact"
 	"github.com/cri-o/cri-o/internal/storage"
@@ -15,21 +16,24 @@ import (
 
 // RemoveImage removes the image.
 func (s *Server) RemoveImage(ctx context.Context, req *types.RemoveImageRequest) (*types.RemoveImageResponse, error) {
+	_ = (*imageprovider.Service)(nil) // Force import usage
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
 
-	imageRef := ""
 	img := req.GetImage()
-
-	if img != nil {
-		imageRef = img.GetImage()
-	}
-
-	if imageRef == "" {
+	if img == nil || img.GetImage() == "" {
 		return nil, errors.New("no image specified")
 	}
 
-	if err := s.removeImage(ctx, imageRef); err != nil {
+	log.Infof(ctx, "Removing image: %s", img.GetImage())
+
+	// Use image provider service if available
+	if s.imageProviderService != nil {
+		return s.removeImageWithProviders(ctx, req)
+	}
+
+	// Legacy path
+	if err := s.removeImage(ctx, img.GetImage()); err != nil {
 		return nil, err
 	}
 
@@ -143,4 +147,20 @@ func (s *Server) volumeInUse(digest string) error {
 	}
 
 	return nil
+}
+
+// removeImageWithProviders uses the pluggable image provider system for image removal
+func (s *Server) removeImageWithProviders(ctx context.Context, req *types.RemoveImageRequest) (*types.RemoveImageResponse, error) {
+	img := req.GetImage()
+	
+	// Try to remove using image provider service
+	err := s.imageProviderService.RemoveImage(ctx, img)
+	if err != nil {
+		// Fall back to legacy behavior for compatibility
+		if err := s.removeImage(ctx, img.GetImage()); err != nil {
+			return nil, err
+		}
+	}
+	
+	return &types.RemoveImageResponse{}, nil
 }

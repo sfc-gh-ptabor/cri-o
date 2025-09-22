@@ -28,6 +28,7 @@ import (
 	"github.com/cri-o/cri-o/internal/cert"
 	"github.com/cri-o/cri-o/internal/config/seccomp"
 	"github.com/cri-o/cri-o/internal/hostport"
+	"github.com/cri-o/cri-o/internal/imageprovider"
 	"github.com/cri-o/cri-o/internal/lib"
 	"github.com/cri-o/cri-o/internal/lib/sandbox"
 	"github.com/cri-o/cri-o/internal/log"
@@ -94,6 +95,9 @@ type Server struct {
 	nri *nriAPI
 	// hooksRetriever allows getting the runtime hooks for the sandboxes.
 	hooksRetriever *runtimehandlerhooks.HooksRetriever
+
+	// imageProviderService manages pluggable image providers
+	imageProviderService *imageprovider.Service
 
 	types.UnsafeImageServiceServer
 	types.UnsafeRuntimeServiceServer
@@ -596,6 +600,11 @@ func New(
 
 	if err := s.nri.start(); err != nil {
 		return nil, err
+	}
+
+	// Initialize image provider service
+	if err := s.initializeImageProviderService(ctx, config, s.ContainerServer.StorageImageServer()); err != nil {
+		return nil, fmt.Errorf("initialize image provider service: %w", err)
 	}
 
 	if err := watchdog.New(s.checkCRIHealth).Start(ctx); err != nil {

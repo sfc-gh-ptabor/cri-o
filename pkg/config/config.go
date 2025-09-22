@@ -622,6 +622,28 @@ type ImageConfig struct {
 	// If "enforcing", an image pull will fail if a short name is used, but the results are ambiguous.
 	// If "disabled", the first result will be chosen.
 	ShortNameMode string `toml:"short_name_mode"`
+	
+	// ImageProviders contains configuration for pluggable image providers
+	ImageProviders ImageProvidersConfig `toml:"image_providers"`
+}
+
+// ImageProvidersConfig contains configuration for image providers
+type ImageProvidersConfig struct {
+	// EnablePluggableProviders enables the pluggable image provider system
+	EnablePluggableProviders bool `toml:"enable_pluggable_providers"`
+	
+	// RootFS contains configuration for the root filesystem provider
+	RootFS RootFSProviderConfig `toml:"rootfs"`
+}
+
+// RootFSProviderConfig contains configuration for the root filesystem provider
+type RootFSProviderConfig struct {
+	// Enable enables the root filesystem provider
+	Enable bool `toml:"enable"`
+	
+	// AllowedPaths is a list of allowed base paths for root filesystem images
+	// If empty, any absolute path is allowed (not recommended for production)
+	AllowedPaths []string `toml:"allowed_paths"`
 }
 
 // NetworkConfig represents the "crio.network" TOML config table.
