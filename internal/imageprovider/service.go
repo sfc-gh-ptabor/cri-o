@@ -115,3 +115,4 @@ func (s *Service) GetProviders() []string {
 	}
 	return names
 }
+
